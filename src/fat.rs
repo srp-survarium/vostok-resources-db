@@ -364,17 +364,18 @@ impl Archive {
         Ok(data)
     }
 
-    /// Read and (if needed) decompress the payload for a file entry.
+    /// Read the payload for a file entry.
+    ///
+    /// The shipped resources.db stores everything uncompressed. PPMd-compressed
+    /// payloads are not handled here — the decoder lives on the `ppmd` branch;
+    /// this returns an error for them.
     pub fn read_file(&mut self, e: &FileEntry) -> io::Result<Vec<u8>> {
         let raw = self.read_raw(e)?;
         match e.kind {
-            NodeKind::File { compressed: true, .. } => {
-                let mut out = vec![0u8; e.uncompressed_size as usize];
-                crate::ppmd::decompress(&raw, &mut out).map_err(|err| {
-                    io::Error::new(io::ErrorKind::InvalidData, format!("ppmd: {err}"))
-                })?;
-                Ok(out)
-            }
+            NodeKind::File { compressed: true, .. } => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "PPMd-compressed payload — decoder is on the `ppmd` branch",
+            )),
             _ => Ok(raw),
         }
     }

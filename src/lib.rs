@@ -13,14 +13,10 @@
 //! buffer (offset 0 == NULL). File payloads live in the data blob and are
 //! located by absolute file offset (`pos_in_db`).
 //!
-//! PPMd-compressed payloads use a custom Dmitry Shkarin PPMd variant (order 8,
-//! Subbotin range coder with BOT=1<<15); see [`ppmd`].
+//! PPMd-compressed payloads (custom Dmitry Shkarin PPMd, order 8) do not occur
+//! in the shipped resources.db, so the decoder is kept on the `ppmd` branch
+//! rather than here.
 
 pub mod fat;
-// Several allocator/model helpers in the PPMd port are only exercised by the
-// cut_off / freeze model-restoration paths (this build uses
-// model_restoration_restart). They are kept faithful to the C++ source.
-#[allow(dead_code)]
-pub mod ppmd;
 
 pub use fat::{Archive, NodeKind, FileEntry};
