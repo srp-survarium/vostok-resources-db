@@ -75,36 +75,60 @@ bitflags::bitflags! {
     }
 }
 
-// ---- 64-bit struct member offsets (verified via probe against MSVC pack(8)) -
-// base_node<64>: pointers are 8 bytes; m_flags is a u16, m_name is inline.
+// ===========================================================================
+// 64-bit node layout (verified by probing the real archive against MSVC pack(8)).
+// The C++ structs are reproduced as comments before each const group so the
+// offsets can be checked against them without modelling every class in Rust.
+// ===========================================================================
+
+// base_node<64> — sources/vostok/vfs/base_node.h (pack(8)):
+//   off  field                                              size
+//   @0   union { m_mount_root; m_mount_helper_parent }        8
+//   @8   node_pointer        m_next_overlapped                8
+//   @16  node_pointer        m_hashset_next                   8
+//   @24  node_pointer        m_next                           8   <- BASE_NODE_NEXT
+//   @32  folder_node_pointer m_parent                         8
+//   @40  association_pointer m_association                    8
+//   @48  u16                 m_flags                          2   <- BASE_NODE_FLAGS
+//   @50  u8                  m_association_lock               1
+//   @51  char                m_name[]                  (flexible) <- BASE_NODE_NAME
+//   => sizeof 56 (51 rounded up to 8-byte alignment)
 const BASE_NODE_NEXT: usize = 24;
 const BASE_NODE_FLAGS: usize = 48;
 const BASE_NODE_NAME: usize = 51;
 
-// base_off = offset of the `base_node` member inside each final node class.
-// (A stored node pointer points AT the base_node; we subtract base_off to find
-//  the start of the final class where the archive_file_node_base / inline data
-//  fields live.)
+// base_off = offset of the embedded `base_node` within each final node class.
+// (A stored pointer points AT base_node; subtract base_off for the class start,
+//  where archive_file_node_base / inline-data fields live.) Layouts (pack(8)):
+//   base_folder_node            { node* m_first_child@0; counters@8; base_node base@16 }                 -> 16
+//   archive_file_node           { archive_file_node_base afnb@0 (24); base_node base@24 }                 -> 24
+//   archive_compressed_file_node{ afnb@0 (24); u32 uncompressed_size@24; <pad>; base_node base@32 }       -> 32
+//   archive_inline_file_node    { afnb@0 (24); archive_inline_file_node_base aifnb@24 (16); base@40 }      -> 40
+//   archive_inline_compressed.. { afnb@0; aifnb@24; u32 uncompressed_size@40; <pad>; base@48 }            -> 48
+//   soft_link_node / hard_link_node { node* referenced@0; base_node base@8 }                              -> 8
+//   erased_node                 { base_node base@0 }                                                      -> 0
+//   external_subfat_node        { <16-byte prefix>@0; base_node base@16 }                                 -> 16
+//   archive_folder_mount_root_node:
+//       mount_root_node_base(104) + 3*char[260] + char[32] + 2*ptr => folder@936, folder.base@936+16      -> 952
 const BASE_OFF_FOLDER: usize = 16;
-const BASE_OFF_FILE: usize = 24; // archive_file_node : afnb; base
-const BASE_OFF_COMPRESSED: usize = 32; // afnb; u32 ucs; base
-const BASE_OFF_INLINE: usize = 40; // afnb; aifnb; base
-const BASE_OFF_INLINE_COMPRESSED: usize = 48; // afnb; aifnb; u32 ucs; base
+const BASE_OFF_FILE: usize = 24;
+const BASE_OFF_COMPRESSED: usize = 32;
+const BASE_OFF_INLINE: usize = 40;
+const BASE_OFF_INLINE_COMPRESSED: usize = 48;
 const BASE_OFF_SOFT_LINK: usize = 8;
 const BASE_OFF_HARD_LINK: usize = 8;
 const BASE_OFF_ERASED: usize = 0;
 const BASE_OFF_EXTERNAL: usize = 16;
-// archive_folder_mount_root_node<64>: mount_root_node_base(104) + 3*char[260]
-// + char[32] + 2*ptr(16) => folder@936, folder.base@936+16 = 952.
 const BASE_OFF_MOUNT_ROOT: usize = 952;
 
-// archive_inline_file_node_base: ptr m_inlined_data @0; u32 m_inlined_size @8
-// (relative to the start of the aifnb sub-object, which immediately follows the
-//  24-byte afnb sub-object).
-const AIFNB_OFF: usize = 24; // offset of aifnb sub-object from node start
+// archive_inline_file_node_base — { ptr m_inlined_data@0; u32 m_inlined_size@8 }.
+// It follows the 24-byte afnb sub-object in the inline node classes, so the
+// aifnb starts at node+24 and m_inlined_data (the payload's buffer offset) is
+// at node + AIFNB_OFF.
+const AIFNB_OFF: usize = 24;
 
-// mount_root_node_base: the `node` pointer field is the 9th pointer (offset 64);
-// it stores the buffer offset of the root folder's base_node.
+// mount_root_node_base — the `node` pointer is the 9th 8-byte field (@64); it
+// stores the buffer offset of the root folder's base_node.
 const MOUNT_ROOT_NODE_PTR_OFF: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
