@@ -82,7 +82,11 @@ fn run_list(db: &Path) -> Result<(), Box<dyn std::error::Error>> {
         };
         println!(
             "{:<18} {:>12} {:>12} {:>12}  {}",
-            tag, e.size_in_db, e.uncompressed_size, e.pos_in_db, e.path
+            tag,
+            e.size_in_db,
+            e.uncompressed_size,
+            e.pos_in_db,
+            String::from_utf8_lossy(&e.path) // display only; the stored path is raw bytes
         );
     }
     eprintln!(
@@ -129,13 +133,17 @@ fn run_extract(db: &Path, out_dir: &Path) -> Result<(), Box<dyn std::error::Erro
     Ok(())
 }
 
-/// Strip any path components that could escape the output dir.
-fn sanitize(path: &str) -> PathBuf {
+/// Strip any path components that could escape the output dir. Operates on raw
+/// bytes (engine paths aren't guaranteed UTF-8) and maps them straight to
+/// filesystem path components.
+fn sanitize(path: &[u8]) -> PathBuf {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
     let mut out = PathBuf::new();
-    for comp in path.split(['/', '\\']) {
+    for comp in path.split(|&b| b == b'/' || b == b'\\') {
         match comp {
-            "" | "." | ".." => {}
-            other => out.push(Path::new(other)),
+            b"" | b"." | b".." => {}
+            other => out.push(OsStr::from_bytes(other)),
         }
     }
     out

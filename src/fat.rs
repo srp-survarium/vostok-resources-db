@@ -120,14 +120,16 @@ impl BaseNode {
         read::<u64>(buf, base_node_off + Self::NEXT) as usize
     }
 
-    /// Inline NUL-terminated node name.
-    fn name(buf: &[u8], base_node_off: usize) -> String {
+    /// Inline NUL-terminated node name, as raw bytes — engine paths are not
+    /// guaranteed valid UTF-8, and lossy decoding would corrupt them (and break
+    /// a byte-identical repack).
+    fn name(buf: &[u8], base_node_off: usize) -> &[u8] {
         let start = base_node_off + Self::NAME;
         let mut end = start;
         while end < buf.len() && buf[end] != 0 {
             end += 1;
         }
-        String::from_utf8_lossy(&buf[start..end]).into_owned()
+        &buf[start..end]
     }
 }
 
@@ -135,15 +137,15 @@ impl BaseNode {
 // (A stored pointer points AT base_node; subtract base_off for the class start,
 //  where archive_file_node_base / inline-data fields live.) Layouts (pack(8)):
 //   base_folder_node            { node* m_first_child@0; counters@8; base_node base@16 }                 -> 16
-//   archive_file_node           { archive_file_node_base afnb@0 (24); base_node base@24 }                 -> 24
-//   archive_compressed_file_node{ afnb@0 (24); u32 uncompressed_size@24; <pad>; base_node base@32 }       -> 32
-//   archive_inline_file_node    { afnb@0 (24); archive_inline_file_node_base aifnb@24 (16); base@40 }      -> 40
-//   archive_inline_compressed.. { afnb@0; aifnb@24; u32 uncompressed_size@40; <pad>; base@48 }            -> 48
-//   soft_link_node / hard_link_node { node* referenced@0; base_node base@8 }                              -> 8
-//   erased_node                 { base_node base@0 }                                                      -> 0
-//   external_subfat_node        { <16-byte prefix>@0; base_node base@16 }                                 -> 16
+//   archive_file_node           { archive_file_node_base afnb@0 (24); base_node base@24 }                -> 24
+//   archive_compressed_file_node{ afnb@0 (24); u32 uncompressed_size@24; <pad>; base_node base@32 }      -> 32
+//   archive_inline_file_node    { afnb@0 (24); archive_inline_file_node_base aifnb@24 (16); base@40 }    -> 40
+//   archive_inline_compressed.. { afnb@0; aifnb@24; u32 uncompressed_size@40; <pad>; base@48 }           -> 48
+//   soft_link_node / hard_link_node { node* referenced@0; base_node base@8 }                             -> 8
+//   erased_node                 { base_node base@0 }                                                     -> 0
+//   external_subfat_node        { <16-byte prefix>@0; base_node base@16 }                                -> 16
 //   archive_folder_mount_root_node:
-//       mount_root_node_base(104) + 3*char[260] + char[32] + 2*ptr => folder@936, folder.base@936+16      -> 952
+//       mount_root_node_base(104) + 3*char[260] + char[32] + 2*ptr => folder@936, folder.base@936+16     -> 952
 //
 /// Zero-sized namespace for the per-class `base_node` offsets and the flag →
 /// offset lookup.
@@ -212,8 +214,9 @@ pub enum NodeKind {
 
 #[derive(Debug, Clone)]
 pub struct FileEntry {
-    /// Full virtual path relative to the archive root (e.g. `vostok/foo.cfg`).
-    pub path: String,
+    /// Full virtual path relative to the archive root, as raw bytes (engine
+    /// paths are not guaranteed valid UTF-8), e.g. `b"vostok/foo.cfg"`.
+    pub path: Vec<u8>,
     pub kind: NodeKind,
     /// Number of bytes stored in the db (compressed size when compressed).
     pub size_in_db: u32,
@@ -269,7 +272,7 @@ impl Archive {
         let root = self.root_base_node_off();
         // The root mount-root node has an empty name; descend into its children.
         debug_assert!(BaseNode::flags(&self.buf, root).contains(NodeFlags::FOLDER));
-        self.walk_folder_children(root, "", &mut out);
+        self.walk_folder_children(root, b"", &mut out);
         out
     }
 
@@ -352,7 +355,7 @@ impl Archive {
     fn walk_folder_children(
         &self,
         folder_base_node_off: usize,
-        prefix: &str,
+        prefix: &[u8],
         out: &mut Vec<FileEntry>,
     ) {
         let flags = BaseNode::flags(&self.buf, folder_base_node_off);
@@ -363,13 +366,17 @@ impl Archive {
         }
     }
 
-    fn visit_node(&self, base_node_off: usize, prefix: &str, out: &mut Vec<FileEntry>) {
+    fn visit_node(&self, base_node_off: usize, prefix: &[u8], out: &mut Vec<FileEntry>) {
         let flags = BaseNode::flags(&self.buf, base_node_off);
         let name = BaseNode::name(&self.buf, base_node_off);
         let path = if prefix.is_empty() {
-            name.clone()
+            name.to_vec()
         } else {
-            format!("{}/{}", prefix, name)
+            let mut p = Vec::with_capacity(prefix.len() + 1 + name.len());
+            p.extend_from_slice(prefix);
+            p.push(b'/');
+            p.extend_from_slice(name);
+            p
         };
         let kind = self.kind_for(flags);
 
@@ -421,7 +428,7 @@ impl Archive {
     }
 
     /// Read the file-payload fields for a file node given its base_node offset.
-    fn read_file_fields(&self, base_node_off: usize, flags: NodeFlags, path: String) -> FileEntry {
+    fn read_file_fields(&self, base_node_off: usize, flags: NodeFlags, path: Vec<u8>) -> FileEntry {
         let compressed = flags.contains(NodeFlags::COMPRESSED);
         let inlined = flags.contains(NodeFlags::INLINED);
         let node_start = base_node_off - BaseOff::for_flags(flags);
