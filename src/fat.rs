@@ -26,11 +26,11 @@ const _: () = assert!(std::mem::size_of::<usize>() == std::mem::size_of::<u64>()
 /// data blob.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
-struct FatHeader {
-    endian_string: [u8; 14],
-    _pad: [u8; 2],
-    num_nodes: u32,
-    buffer_size: u32,
+pub struct FatHeader {
+    pub endian_string: [u8; 14],
+    pub _pad: [u8; 2],
+    pub num_nodes: u32,
+    pub buffer_size: u32,
 }
 
 /// File-payload location — `archive_file_node_base` in
@@ -40,16 +40,16 @@ struct FatHeader {
 /// `size_in_db` are alignment padding before it.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
-struct ArchiveFileNodeBase {
+pub struct ArchiveFileNodeBase {
     /// Bytes stored in the db (compressed size when compressed).
-    size_in_db: u32,
-    _pad: u32,
+    pub size_in_db: u32,
+    pub _pad: u32,
     /// Absolute file offset of the payload.
-    pos_in_db: u64,
-    hash: u32,
+    pub pos_in_db: u64,
+    pub hash: u32,
     // Trailing padding to the struct's 8-byte alignment (pack(8) makes the C++
     // struct 24 bytes); explicit so bytemuck::Pod accepts it.
-    _pad2: u32,
+    pub _pad2: u32,
 }
 
 bitflags::bitflags! {
@@ -76,8 +76,14 @@ bitflags::bitflags! {
 }
 
 /// Read a little-endian POD value from `buf` at `off`.
-fn read<T: Pod>(buf: &[u8], off: usize) -> T {
+pub fn read<T: Pod>(buf: &[u8], off: usize) -> T {
     bytemuck::pod_read_unaligned(&buf[off..off + std::mem::size_of::<T>()])
+}
+
+/// Write a little-endian POD value into `buf` at `off` — the inverse of [`read`],
+/// used by the packer ([`crate::pack`]) to emit node fields and fixed sub-structs.
+pub fn write<T: Pod>(buf: &mut [u8], off: usize, val: T) {
+    buf[off..off + std::mem::size_of::<T>()].copy_from_slice(bytemuck::bytes_of(&val));
 }
 
 // ===========================================================================
@@ -101,14 +107,19 @@ fn read<T: Pod>(buf: &[u8], off: usize) -> T {
 //
 /// The common node header every node embeds. Zero-sized: it just namespaces the
 /// field offsets within `base_node` and the readers for the fields we use. A
-/// stored node pointer points AT a node's `base_node`, so these read relative to
-/// that offset.
-struct BaseNode;
+/// stored node pointer points AT a node's `base_node`, so these are relative to
+/// that offset (the reader reads, the packer writes, these fields).
+pub struct BaseNode;
 
 impl BaseNode {
-    const NEXT: usize = 24;
-    const FLAGS: usize = 48;
-    const NAME: usize = 51;
+    /// `union { m_mount_root; m_mount_helper_parent }` at the base_node start.
+    pub const MOUNT_ROOT_UNION: usize = 0;
+    pub const NEXT: usize = 24;
+    pub const PARENT: usize = 32;
+    pub const FLAGS: usize = 48;
+    pub const NAME: usize = 51;
+    /// `sizeof(base_node)` without the flexible name (51 rounded up to 8).
+    pub const SIZEOF: usize = 56;
 
     /// Node flags at `base_node_off`.
     fn flags(buf: &[u8], base_node_off: usize) -> NodeFlags {
@@ -149,11 +160,11 @@ impl BaseNode {
 //
 /// Zero-sized namespace for the per-class `base_node` offsets and the flag →
 /// offset lookup.
-struct BaseOff;
+pub struct BaseOff;
 
 impl BaseOff {
-    const FOLDER: usize = 16;
-    const FILE: usize = 24;
+    pub const FOLDER: usize = 16;
+    pub const FILE: usize = 24;
     const COMPRESSED: usize = 32;
     const INLINE: usize = 40;
     const INLINE_COMPRESSED: usize = 48;
@@ -161,10 +172,10 @@ impl BaseOff {
     const HARD_LINK: usize = 8;
     const ERASED: usize = 0;
     const EXTERNAL: usize = 16;
-    const MOUNT_ROOT: usize = 952;
+    pub const MOUNT_ROOT: usize = 952;
 
     /// base_off for a node with the given `flags`.
-    fn for_flags(flags: NodeFlags) -> usize {
+    pub fn for_flags(flags: NodeFlags) -> usize {
         if flags.contains(NodeFlags::MOUNT_ROOT) {
             Self::MOUNT_ROOT
         } else if flags.contains(NodeFlags::FOLDER) {
@@ -189,6 +200,12 @@ impl BaseOff {
             Self::FILE
         }
     }
+
+    /// `sizeof(final class)` without the trailing name: the embedded `base_node`
+    /// offset plus `sizeof(base_node)`. Used by the packer to advance offsets.
+    pub fn class_sizeof(flags: NodeFlags) -> usize {
+        Self::for_flags(flags) + BaseNode::SIZEOF
+    }
 }
 
 // archive_inline_file_node_base — { ptr m_inlined_data@0; u32 m_inlined_size@8 }.
@@ -197,9 +214,26 @@ impl BaseOff {
 // at node + AIFNB_OFF.
 const AIFNB_OFF: usize = 24;
 
-// mount_root_node_base — the `node` pointer is the 9th 8-byte field (@64); it
-// stores the buffer offset of the root folder's base_node.
-const MOUNT_ROOT_NODE_PTR_OFF: usize = 64;
+// archive_folder_mount_root_node — sources/vostok/vfs/sources/*.h (pack(8)):
+//   mount_root_node_base(104) { ...; node* node @64; u32 mount_type @92; ... }
+//   followed by 3*string_path + char[32] + 2*ptr, so the embedded folder
+//   (a base_folder_node) lands at @936 and its base_node at 936+16 = 952
+//   (== BaseOff::MOUNT_ROOT). m_first_child is folder+0 = @936.
+/// Zero-sized namespace for the mount-root class field offsets, relative to the
+/// node-class start (shared by the reader and the packer).
+pub struct MountRoot;
+
+impl MountRoot {
+    /// `mount_root_node_base::node` — buffer offset of the root folder's base_node.
+    pub const NODE_PTR: usize = 64;
+    /// `mount_root_node_base::mount_type` (a u32 `mount_type_enum`).
+    pub const MOUNT_TYPE: usize = 92;
+    /// `archive_folder_mount_root_node::folder` (the embedded base_folder_node;
+    /// its `m_first_child` is at +0).
+    pub const FOLDER: usize = 936;
+    /// `mount_type_archive` (`vostok::vfs::mount_type_enum`).
+    pub const MOUNT_TYPE_ARCHIVE: u32 = 2;
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NodeKind {
@@ -315,7 +349,7 @@ impl Archive {
         // The mount root node sits at buffer offset 0; its `node` field points
         // at the root folder's base_node. Trust that field, falling back to the
         // computed mount-root layout offset.
-        let ptr = read::<u64>(&self.buf, MOUNT_ROOT_NODE_PTR_OFF) as usize;
+        let ptr = read::<u64>(&self.buf, MountRoot::NODE_PTR) as usize;
         if ptr != 0 && ptr < self.buf.len() {
             ptr
         } else {
@@ -467,7 +501,7 @@ impl Archive {
 /// offset 936 within the class, so m_first_child is at 936.
 fn folder_start_within(flags: NodeFlags) -> usize {
     if flags.contains(NodeFlags::MOUNT_ROOT) {
-        936 // archive_folder_mount_root_node::folder offset (m_first_child @ +0)
+        MountRoot::FOLDER // m_first_child @ folder+0
     } else {
         0
     }

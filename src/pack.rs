@@ -26,8 +26,11 @@
 //! 5. the 24-byte `fat_header` and the 2048-aligned FAT reservation;
 //! 6. the data blob: payloads written in node-save (depth-first) order.
 //!
-//! The on-disk node-class layouts (PC, MSVC `pack(8)`, 64-bit) are reproduced as
-//! byte offsets below; see `sources/vostok/vfs/sources/*.h` for the C++ structs.
+//! The on-disk node-class layouts (PC, MSVC `pack(8)`, 64-bit) are the same ones
+//! the reader documents: this module reuses [`crate::fat`]'s `BaseNode` /
+//! `BaseOff` / `MountRoot` offset namespaces and the `FatHeader` /
+//! `ArchiveFileNodeBase` POD structs (written via [`crate::fat::write`]) instead
+//! of redeclaring them. See `sources/vostok/vfs/sources/*.h` for the C++ structs.
 //!
 //! ## Reconstructable vs not
 //! [`Packer::serialize_fat`] + [`data_blob_origin`] reproduce the FAT and blob
@@ -42,7 +45,13 @@
 //! over-count (+4 over the saved node count, from the source mount's helper
 //! nodes) and the 2 uninitialised struct-padding bytes after the endian string.
 
-use crate::fat::{NodeFlags, RawNode};
+// The on-disk node-class layouts, field offsets, and POD sub-structs are shared
+// with the reader: this module reuses fat's `BaseNode` / `BaseOff` / `MountRoot`
+// namespaces and `FatHeader` / `ArchiveFileNodeBase` rather than redeclaring the
+// offsets, and emits fields with fat's `write::<T>` (the inverse of `read::<T>`).
+use crate::fat::{
+    write, ArchiveFileNodeBase, BaseNode, BaseOff, FatHeader, MountRoot, NodeFlags, RawNode,
+};
 
 /// `fat_align` default from `pack_archive_args` (`pack_archive.h`).
 const FAT_ALIGN: u32 = 2048;
@@ -51,36 +60,6 @@ const NODE_ALIGN: usize = 8;
 /// `sizeof(string_path)` — the mount-root node's name field is this wide.
 /// `string_path` is `fixed_string<260>` → 260 bytes of inline storage.
 const STRING_PATH_SIZE: usize = 260;
-
-// --- base_node<64> field offsets (pack(8)), relative to the base_node start ---
-const BN_MOUNT_ROOT: usize = 0; // union { m_mount_root / m_mount_helper_parent }
-const BN_NEXT_OVERLAPPED: usize = 8;
-const BN_HASHSET_NEXT: usize = 16;
-const BN_NEXT: usize = 24;
-const BN_PARENT: usize = 32;
-const BN_ASSOCIATION: usize = 40;
-const BN_FLAGS: usize = 48;
-const BN_NAME: usize = 51;
-/// `sizeof(base_node)` without name, rounded to pack(8): the name starts at 51,
-/// so the class is at least 56 bytes before the flexible array contributes.
-const BASE_NODE_SIZEOF: usize = 56;
-
-// --- base_off: offset of the embedded base_node within each final class ---
-const OFF_FILE: usize = 24; // archive_file_node: afnb(24) | base
-const OFF_COMPRESSED: usize = 32; // afnb(24) + u32 + pad | base
-const OFF_FOLDER: usize = 16; // first_child(8) + counters(8) | base
-const OFF_HARD_LINK: usize = 8; // referenced(8) | base
-const OFF_MOUNT_ROOT: usize = 952; // mount_root_node_base + folder(@936) + base(@16)
-
-/// Offset of `archive_folder_mount_root_node::folder` (`m_first_child`).
-const MOUNT_ROOT_FOLDER_OFF: usize = 936;
-/// Offset of `mount_root_node_base::node` within the mount-root class.
-const MOUNT_ROOT_NODE_PTR_OFF: usize = 64;
-/// Offset of `mount_root_node_base::mount_type` (a u32 enum). The packer's
-/// `archive_folder_mount_root_node` is constructed with `mount_type_archive`.
-const MOUNT_ROOT_MOUNT_TYPE_OFF: usize = 92;
-/// `mount_type_archive` (`vostok::vfs::mount_type_enum`).
-const MOUNT_TYPE_ARCHIVE: u32 = 2;
 
 /// crc32 used throughout the engine for file/path hashing:
 /// `boost::crc_optimal<32, 0x04C11DB7, init=0, refin=true, refout=false>`.
@@ -100,36 +79,6 @@ pub fn crc32(data: &[u8]) -> u32 {
         }
     }
     crc.reverse_bits()
-}
-
-/// base_off for the given node flags (offset of base_node within the class).
-fn base_off(flags: NodeFlags) -> usize {
-    if flags.contains(NodeFlags::MOUNT_ROOT) {
-        OFF_MOUNT_ROOT
-    } else if flags.contains(NodeFlags::FOLDER) {
-        OFF_FOLDER
-    } else if flags.contains(NodeFlags::HARD_LINK) {
-        OFF_HARD_LINK
-    } else if flags.contains(NodeFlags::COMPRESSED) {
-        OFF_COMPRESSED
-    } else {
-        OFF_FILE
-    }
-}
-
-/// `sizeof(final class)` without the trailing name, for each supported class.
-fn class_sizeof(flags: NodeFlags) -> usize {
-    if flags.contains(NodeFlags::MOUNT_ROOT) {
-        OFF_MOUNT_ROOT + BASE_NODE_SIZEOF
-    } else if flags.contains(NodeFlags::FOLDER) {
-        OFF_FOLDER + BASE_NODE_SIZEOF
-    } else if flags.contains(NodeFlags::HARD_LINK) {
-        OFF_HARD_LINK + BASE_NODE_SIZEOF
-    } else if flags.contains(NodeFlags::COMPRESSED) {
-        OFF_COMPRESSED + BASE_NODE_SIZEOF
-    } else {
-        OFF_FILE + BASE_NODE_SIZEOF
-    }
 }
 
 /// Length of a node's name field, including the NUL. The mount root uses the
@@ -163,6 +112,7 @@ pub struct Packer<'a> {
     mount_root_base_off: usize,
 }
 
+/// Public API.
 impl<'a> Packer<'a> {
     /// Serialize the parsed tree into a FAT node buffer (the bytes after the
     /// 24-byte header). The tree's child order must already match the engine's.
@@ -183,12 +133,15 @@ impl<'a> Packer<'a> {
         p.emit(root, &mut buf);
         buf
     }
+}
 
+/// Internals: depth-first offset placement, then byte emission.
+impl<'a> Packer<'a> {
     /// Depth-first offset assignment, mirroring `save_nodes` advancing
     /// `m_env.cur_offs` by each node's padded size before recursing.
     fn place(&mut self, node: &'a RawNode) {
         let node_start = self.cur_offs;
-        let base = node_start + base_off(node.flags);
+        let base = node_start + BaseOff::for_flags(node.flags);
         self.base_off_by_orig.insert(node.base_node_off, base);
         if node.flags.contains(NodeFlags::MOUNT_ROOT) {
             // m_mount_root_offs points at the mount_root_node_base, which is the
@@ -196,7 +149,7 @@ impl<'a> Packer<'a> {
             self.mount_root_base_off = node_start;
         }
 
-        let size = class_sizeof(node.flags) + name_len_with_zero(node);
+        let size = BaseOff::class_sizeof(node.flags) + name_len_with_zero(node);
         let padded_size = align_up(size, NODE_ALIGN);
         self.placed.push(Placed { node, node_start });
         self.cur_offs += padded_size;
@@ -232,41 +185,42 @@ impl<'a> Packer<'a> {
     ) {
         let pl = by_orig[&node.base_node_off];
         let node_start = pl.node_start;
-        let base = node_start + base_off(node.flags);
+        let base = node_start + BaseOff::for_flags(node.flags);
 
         // --- base_node common header ---
-        // m_mount_root / mount_helper_parent
+        // The union { m_mount_root / m_mount_helper_parent } @ base+0:
         if node.flags.contains(NodeFlags::MOUNT_ROOT) {
-            // root: mount_helper_parent = NULL (already zero); set `node` ptr and
-            // the constant `mount_type_archive`.
-            write_u64(buf, node_start + MOUNT_ROOT_NODE_PTR_OFF, base as u64);
-            write_u32(
+            // root: mount_helper_parent = NULL (already zero); set the `node` ptr
+            // and the constant `mount_type_archive` in mount_root_node_base.
+            write(buf, node_start + MountRoot::NODE_PTR, base as u64);
+            write(
                 buf,
-                node_start + MOUNT_ROOT_MOUNT_TYPE_OFF,
-                MOUNT_TYPE_ARCHIVE,
+                node_start + MountRoot::MOUNT_TYPE,
+                MountRoot::MOUNT_TYPE_ARCHIVE,
             );
         } else {
-            write_u64(buf, base + BN_MOUNT_ROOT, self.mount_root_base_off as u64);
+            write(
+                buf,
+                base + BaseNode::MOUNT_ROOT_UNION,
+                self.mount_root_base_off as u64,
+            );
         }
-        // next_overlapped / hashset_next / association stay NULL (0).
-        let _ = (BN_NEXT_OVERLAPPED, BN_HASHSET_NEXT, BN_ASSOCIATION);
+        // m_next_overlapped / m_hashset_next / m_association stay NULL (0).
         // m_next is wired by the parent when emitting the sibling chain.
-        // m_parent (folder_node_pointer; 0 for the root, 936 for everyone else)
-        write_u64(buf, base + BN_PARENT, parent_ptr as u64);
-        // flags
-        write_u16(buf, base + BN_FLAGS, node.flags.bits());
-        // name
-        write_name(buf, base + BN_NAME, node, name_len_with_zero(node));
+        // m_parent (folder_node_pointer; 0 for the root, 936 for everyone else).
+        write(buf, base + BaseNode::PARENT, parent_ptr as u64);
+        write(buf, base + BaseNode::FLAGS, node.flags.bits());
+        write_name(buf, base + BaseNode::NAME, node, name_len_with_zero(node));
 
         // --- class-specific prefix ---
         if node.is_hard_link() {
             let target_orig = node.hard_link_target_off.expect("hard-link target");
             let target_base = self.placed_base(target_orig);
-            write_u64(buf, node_start, target_base as u64);
+            write(buf, node_start, target_base as u64);
         } else if node.flags.contains(NodeFlags::FOLDER) {
             // base_folder_node::m_first_child (mount root: folder.m_first_child).
             let fc_off = if node.flags.contains(NodeFlags::MOUNT_ROOT) {
-                node_start + MOUNT_ROOT_FOLDER_OFF
+                node_start + MountRoot::FOLDER
             } else {
                 node_start // first_child @ class start for a plain folder
             };
@@ -275,15 +229,23 @@ impl<'a> Packer<'a> {
                 .first()
                 .map(|c| self.placed_base(c.base_node_off))
                 .unwrap_or(0);
-            write_u64(buf, fc_off, first_child as u64);
+            write(buf, fc_off, first_child as u64);
         } else {
-            // archive_file_node_base @ node_start.
-            write_u32(buf, node_start, node.size_in_db);
-            write_u64(buf, node_start + 8, node.pos_in_db);
-            write_u32(buf, node_start + 16, node.hash);
+            // archive_file_node_base @ node_start (a fixed 24-byte POD sub-object).
+            write(
+                buf,
+                node_start,
+                ArchiveFileNodeBase {
+                    size_in_db: node.size_in_db,
+                    _pad: 0,
+                    pos_in_db: node.pos_in_db,
+                    hash: node.hash,
+                    _pad2: 0,
+                },
+            );
             if node.is_compressed() {
                 // u32 uncompressed_size right before base_node.
-                write_u32(buf, base - 8, node.uncompressed_size);
+                write(buf, base - 8, node.uncompressed_size);
             }
         }
 
@@ -297,14 +259,14 @@ impl<'a> Packer<'a> {
             // which is 936 for every node since `cur_offs + is_mount_root != 0`.
             for i in 0..node.children.len() {
                 let child = &node.children[i];
-                self.emit_node(child, buf, MOUNT_ROOT_FOLDER_OFF, by_orig);
+                self.emit_node(child, buf, MountRoot::FOLDER, by_orig);
                 let child_base = self.placed_base(child.base_node_off);
                 let next = node
                     .children
                     .get(i + 1)
                     .map(|c| self.placed_base(c.base_node_off))
                     .unwrap_or(0);
-                write_u64(buf, child_base + BN_NEXT, next as u64);
+                write(buf, child_base + BaseNode::NEXT, next as u64);
             }
         }
     }
@@ -316,16 +278,19 @@ impl<'a> Packer<'a> {
 /// blob and is accounted for by `data_blob_origin` / each file's `pos_in_db`.
 pub fn build_fat_with_header(root: &RawNode, num_nodes: u32) -> Vec<u8> {
     let fat = Packer::serialize_fat(root);
-    let mut out = Vec::with_capacity(24 + fat.len());
-    out.extend_from_slice(b"little-endian\0"); // 14 bytes incl. NUL
-                                               // The 2 bytes between `endian_string[14]` and `num_nodes` are struct padding
-                                               // the engine never initialises (`fat_header` zeroes only the 14-byte string,
-                                               // then `set_little_endian` copies 13 chars + NUL). In the shipped archive
-                                               // they happen to be `15 00` — uninitialised stack, NOT derivable from the
-                                               // tree, so we hardcode the observed value to stay byte-identical.
-    out.extend_from_slice(&[0x15, 0x00]);
-    out.extend_from_slice(&num_nodes.to_le_bytes());
-    out.extend_from_slice(&(fat.len() as u32).to_le_bytes());
+    let header = FatHeader {
+        endian_string: *b"little-endian\0", // 14 bytes incl. NUL
+        // The 2 bytes between `endian_string` and `num_nodes` are struct padding
+        // the engine never initialises (`fat_header` zeroes only the 14-byte
+        // string, then `set_little_endian` copies 13 chars + NUL). In the shipped
+        // archive they happen to be `15 00` — uninitialised stack, NOT derivable
+        // from the tree, so we hardcode the observed value to stay byte-identical.
+        _pad: [0x15, 0x00],
+        num_nodes,
+        buffer_size: fat.len() as u32,
+    };
+    let mut out = Vec::with_capacity(std::mem::size_of::<FatHeader>() + fat.len());
+    out.extend_from_slice(bytemuck::bytes_of(&header));
     out.extend_from_slice(&fat);
     out
 }
@@ -346,7 +311,7 @@ fn max_fat_size(root: &RawNode) -> usize {
     // out_size = total_size_for_extensions_with_limited_size() [0, empty inline]
     //          + sizeof(string_path)
     //          + sizeof(archive_folder_mount_root_node<64>)
-    let mut out = STRING_PATH_SIZE + (OFF_MOUNT_ROOT + BASE_NODE_SIZEOF);
+    let mut out = STRING_PATH_SIZE + (BaseOff::MOUNT_ROOT + BaseNode::SIZEOF);
     out += max_fat_size_impl(root);
     out
 }
@@ -643,7 +608,7 @@ fn file_name_bytes(n: &std::ffi::OsStr) -> Vec<u8> {
 fn compute_fat_sizes(node: &mut SrcNode) -> u32 {
     if node.is_dir {
         // base_folder_node::sizeof_with_name() == sizeof(base_folder_node) + len.
-        let mut size = (OFF_FOLDER + BASE_NODE_SIZEOF) as u32 + node.name.len() as u32 + 1;
+        let mut size = (BaseOff::FOLDER + BaseNode::SIZEOF) as u32 + node.name.len() as u32 + 1;
         for c in &mut node.children {
             size += compute_fat_sizes(c);
         }
@@ -651,7 +616,8 @@ fn compute_fat_sizes(node: &mut SrcNode) -> u32 {
     } else {
         // sizeof(archive_file_node<>) + strlen(name)  [note: no +1 here, matching
         // calculate_sizes_for_file_node exactly].
-        node.fat_size_with_children = (OFF_FILE + BASE_NODE_SIZEOF) as u32 + node.name.len() as u32;
+        node.fat_size_with_children =
+            (BaseOff::FILE + BaseNode::SIZEOF) as u32 + node.name.len() as u32;
     }
     node.fat_size_with_children
 }
@@ -670,15 +636,9 @@ fn sort_tree(node: &mut SrcNode) {
     }
 }
 
-fn write_u16(buf: &mut [u8], off: usize, v: u16) {
-    buf[off..off + 2].copy_from_slice(&v.to_le_bytes());
-}
-fn write_u32(buf: &mut [u8], off: usize, v: u32) {
-    buf[off..off + 4].copy_from_slice(&v.to_le_bytes());
-}
-fn write_u64(buf: &mut [u8], off: usize, v: u64) {
-    buf[off..off + 8].copy_from_slice(&v.to_le_bytes());
-}
+/// Write a node's inline name (NUL-terminated) at `off`; the inverse of
+/// [`crate::fat::BaseNode::name`]. `field_len` is the field width including the
+/// NUL (`STRING_PATH_SIZE` for the mount root, else `strlen + 1`).
 fn write_name(buf: &mut [u8], off: usize, node: &RawNode, field_len: usize) {
     let n = node.name.len().min(field_len.saturating_sub(1));
     buf[off..off + n].copy_from_slice(&node.name[..n]);
