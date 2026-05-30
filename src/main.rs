@@ -3,33 +3,40 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use clap::{Parser, Subcommand};
 use resources_db::{Archive, NodeKind};
 
-fn usage() -> ! {
-    eprintln!("usage:");
-    eprintln!("  resources-db <resources.db> <output-dir>   extract all files");
-    eprintln!("  resources-db --list <resources.db>         list contents");
-    std::process::exit(2);
+/// Unpacker for the Survarium / Vostok engine `resources.db` VFS pack archive.
+#[derive(Parser)]
+#[command(version, about)]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// List the archive's contents.
+    List {
+        /// Path to resources.db.
+        db: PathBuf,
+    },
+    /// Extract all files into a directory.
+    Extract {
+        /// Path to resources.db.
+        db: PathBuf,
+        /// Output directory.
+        out_dir: PathBuf,
+    },
 }
 
 fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().collect();
-
-    if args.len() == 3 && args[1] == "--list" {
-        return match run_list(&args[2]) {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(e) => {
-                eprintln!("error: {e}");
-                ExitCode::FAILURE
-            }
-        };
-    }
-
-    if args.len() != 3 {
-        usage();
-    }
-
-    match run_extract(&args[1], &args[2]) {
+    let cli = Cli::parse();
+    let result = match cli.command {
+        Command::List { db } => run_list(&db),
+        Command::Extract { db, out_dir } => run_extract(&db, &out_dir),
+    };
+    match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("error: {e}");
@@ -38,13 +45,11 @@ fn main() -> ExitCode {
     }
 }
 
-fn run_list(db: &str) -> Result<(), Box<dyn std::error::Error>> {
+fn run_list(db: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let archive = Archive::open(db)?;
     eprintln!("num_nodes={} buffer_size={}", archive.num_nodes, archive.buffer_size);
     let entries = archive.list();
-    let mut files = 0usize;
-    let mut compressed = 0usize;
-    let mut inline = 0usize;
+    let (mut files, mut compressed, mut inline) = (0usize, 0usize, 0usize);
     for e in &entries {
         let tag = match e.kind {
             NodeKind::File { compressed: c, inlined: i } => {
@@ -84,24 +89,18 @@ fn run_list(db: &str) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn run_extract(db: &str, out_dir: &str) -> Result<(), Box<dyn std::error::Error>> {
+fn run_extract(db: &Path, out_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let mut archive = Archive::open(db)?;
     eprintln!("num_nodes={} buffer_size={}", archive.num_nodes, archive.buffer_size);
     let entries = archive.list();
-    let out_root = PathBuf::from(out_dir);
 
-    let mut extracted = 0usize;
-    let mut skipped = 0usize;
+    let (mut extracted, mut skipped) = (0usize, 0usize);
     for e in &entries {
-        match e.kind {
-            NodeKind::File { .. } => {}
-            _ => {
-                skipped += 1;
-                continue;
-            }
+        if !matches!(e.kind, NodeKind::File { .. }) {
+            skipped += 1;
+            continue;
         }
-        let rel = sanitize(&e.path);
-        let dest = out_root.join(&rel);
+        let dest = out_dir.join(sanitize(&e.path));
         if let Some(parent) = dest.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -114,7 +113,10 @@ fn run_extract(db: &str, out_dir: &str) -> Result<(), Box<dyn std::error::Error>
             eprintln!("  {extracted}/{} ...", entries.len());
         }
     }
-    eprintln!("extracted {extracted} files ({skipped} non-file entries skipped) into {out_dir}");
+    eprintln!(
+        "extracted {extracted} files ({skipped} non-file entries skipped) into {}",
+        out_dir.display()
+    );
     Ok(())
 }
 
@@ -123,8 +125,7 @@ fn sanitize(path: &str) -> PathBuf {
     let mut out = PathBuf::new();
     for comp in path.split(['/', '\\']) {
         match comp {
-            "" | "." => {}
-            ".." => {}
+            "" | "." | ".." => {}
             other => out.push(Path::new(other)),
         }
     }

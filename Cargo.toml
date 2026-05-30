@@ -12,5 +12,10 @@ path = "src/main.rs"
 name = "resources_db"
 path = "src/lib.rs"
 
+[dependencies]
+bytemuck = { version = "1", features = ["derive"] }
+bitflags = "2"
+clap = { version = "4", features = ["derive"] }
+
 [profile.release]
 opt-level = 3
