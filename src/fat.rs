@@ -75,10 +75,15 @@ bitflags::bitflags! {
     }
 }
 
+/// Read a little-endian POD value from `buf` at `off`.
+fn read<T: Pod>(buf: &[u8], off: usize) -> T {
+    bytemuck::pod_read_unaligned(&buf[off..off + std::mem::size_of::<T>()])
+}
+
 // ===========================================================================
 // 64-bit node layout (verified by probing the real archive against MSVC pack(8)).
-// The C++ structs are reproduced as comments before each const group so the
-// offsets can be checked against them without modelling every class in Rust.
+// The C++ structs are reproduced as comments so the offsets can be checked
+// against them without modelling every class in Rust.
 // ===========================================================================
 
 // base_node<64> — sources/vostok/vfs/base_node.h (pack(8)):
@@ -86,16 +91,45 @@ bitflags::bitflags! {
 //   @0   union { m_mount_root; m_mount_helper_parent }        8
 //   @8   node_pointer        m_next_overlapped                8
 //   @16  node_pointer        m_hashset_next                   8
-//   @24  node_pointer        m_next                           8   <- BASE_NODE_NEXT
+//   @24  node_pointer        m_next                           8   <- NEXT
 //   @32  folder_node_pointer m_parent                         8
 //   @40  association_pointer m_association                    8
-//   @48  u16                 m_flags                          2   <- BASE_NODE_FLAGS
+//   @48  u16                 m_flags                          2   <- FLAGS
 //   @50  u8                  m_association_lock               1
-//   @51  char                m_name[]                  (flexible) <- BASE_NODE_NAME
+//   @51  char                m_name[]                  (flexible) <- NAME
 //   => sizeof 56 (51 rounded up to 8-byte alignment)
-const BASE_NODE_NEXT: usize = 24;
-const BASE_NODE_FLAGS: usize = 48;
-const BASE_NODE_NAME: usize = 51;
+//
+/// The common node header every node embeds. Zero-sized: it just namespaces the
+/// field offsets within `base_node` and the readers for the fields we use. A
+/// stored node pointer points AT a node's `base_node`, so these read relative to
+/// that offset.
+struct BaseNode;
+
+impl BaseNode {
+    const NEXT: usize = 24;
+    const FLAGS: usize = 48;
+    const NAME: usize = 51;
+
+    /// Node flags at `base_node_off`.
+    fn flags(buf: &[u8], base_node_off: usize) -> NodeFlags {
+        NodeFlags::from_bits_retain(read::<u16>(buf, base_node_off + Self::FLAGS))
+    }
+
+    /// Sibling pointer: buffer offset of the next node (0 == end of list).
+    fn next(buf: &[u8], base_node_off: usize) -> usize {
+        read::<u64>(buf, base_node_off + Self::NEXT) as usize
+    }
+
+    /// Inline NUL-terminated node name.
+    fn name(buf: &[u8], base_node_off: usize) -> String {
+        let start = base_node_off + Self::NAME;
+        let mut end = start;
+        while end < buf.len() && buf[end] != 0 {
+            end += 1;
+        }
+        String::from_utf8_lossy(&buf[start..end]).into_owned()
+    }
+}
 
 // base_off = offset of the embedded `base_node` within each final node class.
 // (A stored pointer points AT base_node; subtract base_off for the class start,
@@ -110,16 +144,50 @@ const BASE_NODE_NAME: usize = 51;
 //   external_subfat_node        { <16-byte prefix>@0; base_node base@16 }                                 -> 16
 //   archive_folder_mount_root_node:
 //       mount_root_node_base(104) + 3*char[260] + char[32] + 2*ptr => folder@936, folder.base@936+16      -> 952
-const BASE_OFF_FOLDER: usize = 16;
-const BASE_OFF_FILE: usize = 24;
-const BASE_OFF_COMPRESSED: usize = 32;
-const BASE_OFF_INLINE: usize = 40;
-const BASE_OFF_INLINE_COMPRESSED: usize = 48;
-const BASE_OFF_SOFT_LINK: usize = 8;
-const BASE_OFF_HARD_LINK: usize = 8;
-const BASE_OFF_ERASED: usize = 0;
-const BASE_OFF_EXTERNAL: usize = 16;
-const BASE_OFF_MOUNT_ROOT: usize = 952;
+//
+/// Zero-sized namespace for the per-class `base_node` offsets and the flag →
+/// offset lookup.
+struct BaseOff;
+
+impl BaseOff {
+    const FOLDER: usize = 16;
+    const FILE: usize = 24;
+    const COMPRESSED: usize = 32;
+    const INLINE: usize = 40;
+    const INLINE_COMPRESSED: usize = 48;
+    const SOFT_LINK: usize = 8;
+    const HARD_LINK: usize = 8;
+    const ERASED: usize = 0;
+    const EXTERNAL: usize = 16;
+    const MOUNT_ROOT: usize = 952;
+
+    /// base_off for a node with the given `flags`.
+    fn for_flags(flags: NodeFlags) -> usize {
+        if flags.contains(NodeFlags::MOUNT_ROOT) {
+            Self::MOUNT_ROOT
+        } else if flags.contains(NodeFlags::FOLDER) {
+            Self::FOLDER
+        } else if flags.contains(NodeFlags::SOFT_LINK) {
+            Self::SOFT_LINK
+        } else if flags.contains(NodeFlags::HARD_LINK) {
+            Self::HARD_LINK
+        } else if flags.contains(NodeFlags::ERASED) {
+            Self::ERASED
+        } else if flags.contains(NodeFlags::EXTERNAL_SUB_FAT) {
+            Self::EXTERNAL
+        } else if flags.contains(NodeFlags::INLINED) {
+            if flags.contains(NodeFlags::COMPRESSED) {
+                Self::INLINE_COMPRESSED
+            } else {
+                Self::INLINE
+            }
+        } else if flags.contains(NodeFlags::COMPRESSED) {
+            Self::COMPRESSED
+        } else {
+            Self::FILE
+        }
+    }
+}
 
 // archive_inline_file_node_base — { ptr m_inlined_data@0; u32 m_inlined_size@8 }.
 // It follows the 24-byte afnb sub-object in the inline node classes, so the
@@ -165,6 +233,7 @@ pub struct Archive {
     pub buffer_size: u32,
 }
 
+/// Public API.
 impl Archive {
     pub fn open<P: AsRef<Path>>(path: P) -> io::Result<Archive> {
         let mut file = File::open(path)?;
@@ -193,34 +262,61 @@ impl Archive {
         })
     }
 
-    /// Read a little-endian POD value from the FAT buffer at `off`.
-    fn read<T: Pod>(&self, off: usize) -> T {
-        bytemuck::pod_read_unaligned(&self.buf[off..off + std::mem::size_of::<T>()])
+    /// Build a flat list of every file entry, reconstructing virtual paths by
+    /// walking the folder/child tree.
+    pub fn list(&self) -> Vec<FileEntry> {
+        let mut out = Vec::new();
+        let root = self.root_base_node_off();
+        // The root mount-root node has an empty name; descend into its children.
+        debug_assert!(BaseNode::flags(&self.buf, root).contains(NodeFlags::FOLDER));
+        self.walk_folder_children(root, "", &mut out);
+        out
     }
 
-    fn flags_at(&self, base_node_off: usize) -> NodeFlags {
-        NodeFlags::from_bits_retain(self.read::<u16>(base_node_off + BASE_NODE_FLAGS))
-    }
-
-    fn name_at(&self, base_node_off: usize) -> String {
-        let start = base_node_off + BASE_NODE_NAME;
-        let mut end = start;
-        while end < self.buf.len() && self.buf[end] != 0 {
-            end += 1;
+    /// Read the raw (possibly compressed) payload bytes for a file entry.
+    pub fn read_raw(&mut self, e: &FileEntry) -> io::Result<Vec<u8>> {
+        if let Some(buf_off) = e.inline_buffer_offset {
+            let start = buf_off as usize;
+            let end = start + e.size_in_db as usize;
+            return Ok(self.buf[start..end].to_vec());
         }
-        String::from_utf8_lossy(&self.buf[start..end]).into_owned()
+        let mut data = vec![0u8; e.size_in_db as usize];
+        self.file.seek(SeekFrom::Start(e.pos_in_db))?;
+        self.file.read_exact(&mut data)?;
+        Ok(data)
     }
 
+    /// Read the payload for a file entry.
+    ///
+    /// The shipped resources.db stores everything uncompressed. PPMd-compressed
+    /// payloads are not handled here — the decoder lives on the `ppmd` branch;
+    /// this returns an error for them.
+    pub fn read_file(&mut self, e: &FileEntry) -> io::Result<Vec<u8>> {
+        let raw = self.read_raw(e)?;
+        match e.kind {
+            NodeKind::File {
+                compressed: true, ..
+            } => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "PPMd-compressed payload — decoder is on the `ppmd` branch",
+            )),
+            _ => Ok(raw),
+        }
+    }
+}
+
+/// Tree-walking internals.
+impl Archive {
     /// Offset (in the FAT buffer) of the root folder's base_node.
     fn root_base_node_off(&self) -> usize {
         // The mount root node sits at buffer offset 0; its `node` field points
         // at the root folder's base_node. Trust that field, falling back to the
         // computed mount-root layout offset.
-        let ptr = self.read::<u64>(MOUNT_ROOT_NODE_PTR_OFF) as usize;
+        let ptr = read::<u64>(&self.buf, MOUNT_ROOT_NODE_PTR_OFF) as usize;
         if ptr != 0 && ptr < self.buf.len() {
             ptr
         } else {
-            BASE_OFF_MOUNT_ROOT
+            BaseOff::MOUNT_ROOT
         }
     }
 
@@ -245,50 +341,12 @@ impl Archive {
         }
     }
 
-    /// base_off (offset of base_node within the final node class) for `flags`.
-    fn base_off_for(&self, flags: NodeFlags) -> usize {
-        if flags.contains(NodeFlags::MOUNT_ROOT) {
-            BASE_OFF_MOUNT_ROOT
-        } else if flags.contains(NodeFlags::FOLDER) {
-            BASE_OFF_FOLDER
-        } else if flags.contains(NodeFlags::SOFT_LINK) {
-            BASE_OFF_SOFT_LINK
-        } else if flags.contains(NodeFlags::HARD_LINK) {
-            BASE_OFF_HARD_LINK
-        } else if flags.contains(NodeFlags::ERASED) {
-            BASE_OFF_ERASED
-        } else if flags.contains(NodeFlags::EXTERNAL_SUB_FAT) {
-            BASE_OFF_EXTERNAL
-        } else if flags.contains(NodeFlags::INLINED) {
-            if flags.contains(NodeFlags::COMPRESSED) {
-                BASE_OFF_INLINE_COMPRESSED
-            } else {
-                BASE_OFF_INLINE
-            }
-        } else if flags.contains(NodeFlags::COMPRESSED) {
-            BASE_OFF_COMPRESSED
-        } else {
-            BASE_OFF_FILE
-        }
-    }
-
-    /// Build a flat list of every file entry, reconstructing virtual paths by
-    /// walking the folder/child tree.
-    pub fn list(&self) -> Vec<FileEntry> {
-        let mut out = Vec::new();
-        let root = self.root_base_node_off();
-        // The root mount-root node has an empty name; descend into its children.
-        debug_assert!(self.flags_at(root).contains(NodeFlags::FOLDER));
-        self.walk_folder_children(root, "", &mut out);
-        out
-    }
-
     fn first_child_of_folder(&self, base_node_off: usize, flags: NodeFlags) -> usize {
         // base_folder_node: m_first_child is at (base_node - 16) for normal
         // folders, and at (folder.base - 16) for the mount root too (folder
         // is a base_folder_node embedded in the mount root).
-        let folder_start = base_node_off - self.base_off_for(flags) + folder_start_within(flags);
-        self.read::<u64>(folder_start) as usize
+        let folder_start = base_node_off - BaseOff::for_flags(flags) + folder_start_within(flags);
+        read::<u64>(&self.buf, folder_start) as usize
     }
 
     fn walk_folder_children(
@@ -297,17 +355,17 @@ impl Archive {
         prefix: &str,
         out: &mut Vec<FileEntry>,
     ) {
-        let flags = self.flags_at(folder_base_node_off);
+        let flags = BaseNode::flags(&self.buf, folder_base_node_off);
         let mut child = self.first_child_of_folder(folder_base_node_off, flags);
         while child != 0 {
             self.visit_node(child, prefix, out);
-            child = self.read::<u64>(child + BASE_NODE_NEXT) as usize;
+            child = BaseNode::next(&self.buf, child);
         }
     }
 
     fn visit_node(&self, base_node_off: usize, prefix: &str, out: &mut Vec<FileEntry>) {
-        let flags = self.flags_at(base_node_off);
-        let name = self.name_at(base_node_off);
+        let flags = BaseNode::flags(&self.buf, base_node_off);
+        let name = BaseNode::name(&self.buf, base_node_off);
         let path = if prefix.is_empty() {
             name.clone()
         } else {
@@ -327,10 +385,10 @@ impl Archive {
                 // base_node at node_start+8. The referenced offset points at
                 // the referenced node's base_node; resolve it and copy its
                 // payload location, but keep this node's own path.
-                let node_start = base_node_off - BASE_OFF_HARD_LINK;
-                let ref_base_off = self.read::<u64>(node_start) as usize;
+                let node_start = base_node_off - BaseOff::HARD_LINK;
+                let ref_base_off = read::<u64>(&self.buf, node_start) as usize;
                 if ref_base_off != 0 && ref_base_off < self.buf.len() {
-                    let ref_flags = self.flags_at(ref_base_off);
+                    let ref_flags = BaseNode::flags(&self.buf, ref_base_off);
                     let mut entry = self.read_file_fields(ref_base_off, ref_flags, path);
                     // Keep the referenced file kind so extraction/decompression
                     // works for the resolved target.
@@ -366,19 +424,19 @@ impl Archive {
     fn read_file_fields(&self, base_node_off: usize, flags: NodeFlags, path: String) -> FileEntry {
         let compressed = flags.contains(NodeFlags::COMPRESSED);
         let inlined = flags.contains(NodeFlags::INLINED);
-        let node_start = base_node_off - self.base_off_for(flags);
+        let node_start = base_node_off - BaseOff::for_flags(flags);
         // archive_file_node_base sits at the start of every file node class.
-        let afnb: ArchiveFileNodeBase = self.read(node_start);
+        let afnb: ArchiveFileNodeBase = read(&self.buf, node_start);
         let uncompressed_size = if compressed {
             // archive(_inline)_compressed_file_node: u32 uncompressed_size,
             // located right before `base`.
-            self.read::<u32>(base_node_off - 8)
+            read::<u32>(&self.buf, base_node_off - 8)
         } else {
             afnb.size_in_db
         };
         let inline_buffer_offset = if inlined {
             // aifnb.m_inlined_data holds the buffer offset of the data.
-            Some(self.read::<u64>(node_start + AIFNB_OFF))
+            Some(read::<u64>(&self.buf, node_start + AIFNB_OFF))
         } else {
             None
         };
@@ -392,37 +450,6 @@ impl Archive {
             uncompressed_size,
             pos_in_db: afnb.pos_in_db,
             inline_buffer_offset,
-        }
-    }
-
-    /// Read the raw (possibly compressed) payload bytes for a file entry.
-    pub fn read_raw(&mut self, e: &FileEntry) -> io::Result<Vec<u8>> {
-        if let Some(buf_off) = e.inline_buffer_offset {
-            let start = buf_off as usize;
-            let end = start + e.size_in_db as usize;
-            return Ok(self.buf[start..end].to_vec());
-        }
-        let mut data = vec![0u8; e.size_in_db as usize];
-        self.file.seek(SeekFrom::Start(e.pos_in_db))?;
-        self.file.read_exact(&mut data)?;
-        Ok(data)
-    }
-
-    /// Read the payload for a file entry.
-    ///
-    /// The shipped resources.db stores everything uncompressed. PPMd-compressed
-    /// payloads are not handled here — the decoder lives on the `ppmd` branch;
-    /// this returns an error for them.
-    pub fn read_file(&mut self, e: &FileEntry) -> io::Result<Vec<u8>> {
-        let raw = self.read_raw(e)?;
-        match e.kind {
-            NodeKind::File {
-                compressed: true, ..
-            } => Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "PPMd-compressed payload — decoder is on the `ppmd` branch",
-            )),
-            _ => Ok(raw),
         }
     }
 }
