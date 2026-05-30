@@ -16,23 +16,30 @@ nix shell nixpkgs#cargo nixpkgs#rustc nixpkgs#gcc --command cargo build --releas
 
 ## How it works (the gist)
 
-`resources.db` is a single file that bundles a **directory index** (the "FAT")
-and the **raw bytes of every file**, one after another:
+`resources.db` is a single file that bundles a **directory index** — which the
+engine calls the **FAT** (*file allocation table*) — and the **raw bytes of
+every file**, one after another:
 
 ```
- resources.db
-┌──────────────────────────────────────────────────────────────┐
-│ header     "little-endian", node count, index size            │
-├──────────────────────────────────────────────────────────────┤
-│ FAT index  a directory tree of nodes:                         │
-│                                                                │
-│    root ─┬─ "vostok" (folder) ─┬─ "foo.cfg" (file → off,size)  │
-│          │                     └─ "bar.dds" (file → off,size)  │
-│          └─ "boost"  (folder) ─── ...                          │
-├──────────────────────────────────────────────────────────────┤
-│ data blob  the raw bytes of every file, concatenated          │
-└──────────────────────────────────────────────────────────────┘
+resources.db
++--------------------------------------------------------------+
+| header     "little-endian", num_nodes, buffer_size           |
++--------------------------------------------------------------+
+| FAT index  a tree of nodes:                                  |
+|                                                              |
+|   root                                                       |
+|    +-- vostok (folder) --+-- foo.cfg  (file: offset, size)   |
+|    |                     +-- bar.dds  (file: offset, size)   |
+|    +-- boost  (folder) --+-- ...                             |
++--------------------------------------------------------------+
+| data blob  raw bytes of every file, concatenated             |
++--------------------------------------------------------------+
 ```
+
+> **Why "FAT"?** It's the engine's own term (`fat_header`, `fat_node`, …), kept
+> here for that reason. It's the same general idea as the classic **FAT
+> filesystem** — a table that locates each file's data — but it is Vostok's VFS
+> index, *not* the Windows FAT12/16/32 on-disk format.
 
 A folder node points at its first child; children are chained through a "next"
 pointer. A file node records where its bytes live in the data blob (an offset
