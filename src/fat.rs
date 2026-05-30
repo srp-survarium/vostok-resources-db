@@ -472,3 +472,129 @@ fn folder_start_within(flags: NodeFlags) -> usize {
         0
     }
 }
+
+// ===========================================================================
+// Structured tree parse (for the packer / round-trip self-test).
+//
+// `parse_tree` walks the FAT buffer and returns the full node tree in the exact
+// child order stored on disk, recovering every field the packer needs to
+// reproduce the FAT byte-for-byte: each node's flags, name, payload size/pos,
+// hash, and (for hard-links) the buffer offset of the referenced node.
+// ===========================================================================
+
+/// A node in the parsed FAT tree (the on-disk structure, not the resolved view
+/// that [`Archive::list`] produces). Hard-links are kept as-is.
+#[derive(Debug, Clone)]
+pub struct RawNode {
+    /// The node's raw flags (concrete class selector).
+    pub flags: NodeFlags,
+    /// Inline node name as raw bytes (no NUL).
+    pub name: Vec<u8>,
+    /// Buffer offset of this node's `base_node` in the original FAT (the value a
+    /// node-pointer would store to point here).
+    pub base_node_off: usize,
+    /// For file nodes: payload size in db, uncompressed size, absolute file
+    /// offset, and the stored crc32 hash. Zero for non-file nodes.
+    pub size_in_db: u32,
+    pub uncompressed_size: u32,
+    pub pos_in_db: u64,
+    pub hash: u32,
+    /// For hard-links: the original base_node offset of the referenced node.
+    pub hard_link_target_off: Option<usize>,
+    /// Child nodes, in stored (on-disk) order. Empty for non-folders.
+    pub children: Vec<RawNode>,
+}
+
+impl RawNode {
+    pub fn is_folder(&self) -> bool {
+        self.flags.contains(NodeFlags::FOLDER)
+    }
+    pub fn is_hard_link(&self) -> bool {
+        self.flags.contains(NodeFlags::HARD_LINK)
+    }
+    pub fn is_inlined(&self) -> bool {
+        self.flags.contains(NodeFlags::INLINED)
+    }
+    pub fn is_compressed(&self) -> bool {
+        self.flags.contains(NodeFlags::COMPRESSED)
+    }
+}
+
+/// The whole parsed archive: the FAT region bytes and the root node.
+pub struct ParsedFat {
+    pub num_nodes: u32,
+    pub buffer_size: u32,
+    /// The raw FAT region after the 24-byte header (`buffer_size` bytes).
+    pub fat_region: Vec<u8>,
+    pub root: RawNode,
+}
+
+impl Archive {
+    /// Slice of the original FAT node buffer.
+    pub fn fat_buffer(&self) -> &[u8] {
+        &self.buf
+    }
+
+    /// Parse the full on-disk node tree, preserving child order and every field
+    /// needed to re-serialize the FAT.
+    pub fn parse_tree(&self) -> ParsedFat {
+        let root_off = self.root_base_node_off();
+        let root = self.parse_node(root_off);
+        ParsedFat {
+            num_nodes: self.num_nodes,
+            buffer_size: self.buffer_size,
+            fat_region: self.buf.clone(),
+            root,
+        }
+    }
+
+    fn parse_node(&self, base_node_off: usize) -> RawNode {
+        let flags = BaseNode::flags(&self.buf, base_node_off);
+        let name = BaseNode::name(&self.buf, base_node_off).to_vec();
+        let mut node = RawNode {
+            flags,
+            name,
+            base_node_off,
+            size_in_db: 0,
+            uncompressed_size: 0,
+            pos_in_db: 0,
+            hash: 0,
+            hard_link_target_off: None,
+            children: Vec::new(),
+        };
+
+        if flags.contains(NodeFlags::HARD_LINK) {
+            let node_start = base_node_off - BaseOff::HARD_LINK;
+            let target = read::<u64>(&self.buf, node_start) as usize;
+            node.hard_link_target_off = Some(target);
+            return node;
+        }
+
+        if flags.contains(NodeFlags::FOLDER) {
+            let mut child = self.first_child_of_folder(base_node_off, flags);
+            while child != 0 {
+                node.children.push(self.parse_node(child));
+                child = BaseNode::next(&self.buf, child);
+            }
+            return node;
+        }
+
+        // File node (archive file; possibly compressed/inlined).
+        if flags.contains(NodeFlags::ARCHIVE)
+            && !flags.contains(NodeFlags::ERASED)
+            && !flags.contains(NodeFlags::EXTERNAL_SUB_FAT)
+        {
+            let node_start = base_node_off - BaseOff::for_flags(flags);
+            let afnb: ArchiveFileNodeBase = read(&self.buf, node_start);
+            node.size_in_db = afnb.size_in_db;
+            node.pos_in_db = afnb.pos_in_db;
+            node.hash = afnb.hash;
+            node.uncompressed_size = if flags.contains(NodeFlags::COMPRESSED) {
+                read::<u32>(&self.buf, base_node_off - 8)
+            } else {
+                afnb.size_in_db
+            };
+        }
+        node
+    }
+}

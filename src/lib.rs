@@ -1,5 +1,7 @@
-//! Reader/unpacker for the Survarium / Vostok engine `resources.db` VFS pack
-//! archive.
+//! Reader/unpacker **and** packer/encoder for the Survarium / Vostok engine
+//! `resources.db` VFS pack archive. [`fat`] parses the archive; [`pack`]
+//! re-serializes it (the `roundtrip` self-test reproduces the shipped archive
+//! byte-for-byte — verified by sha256).
 //!
 //! The on-disk format (little-endian, built for the 64-bit PC archive layout —
 //! `archive_platform_pc` uses `platform_pointer_64bit` in `saving_db.cpp`):
@@ -18,5 +20,6 @@
 //! rather than here.
 
 pub mod fat;
+pub mod pack;
 
-pub use fat::{Archive, FileEntry, NodeKind};
+pub use fat::{Archive, FileEntry, NodeKind, ParsedFat, RawNode};

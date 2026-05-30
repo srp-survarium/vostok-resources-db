@@ -2,7 +2,7 @@
 name = "resources-db"
 version = "0.1.0"
 edition = "2021"
-description = "Unpacker for the Survarium / Vostok engine resources.db VFS pack archive"
+description = "Packer/unpacker for the Survarium / Vostok engine resources.db VFS pack archive"
 
 [[bin]]
 name = "resources-db"
