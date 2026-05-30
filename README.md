@@ -87,7 +87,9 @@ folder: m_first_child @0 (relative to base_folder_node start)
 ```
 
 The root folder's `base_node` offset is read from the mount-root node's `node`
-pointer field at buffer offset 64. (See `src/fat.rs` for the per-class layouts.)
+pointer field at buffer offset 64. See `src/fat.rs` for the per-class layouts,
+and [docs/node-layouts.md](docs/node-layouts.md) for ASCII diagrams of every
+node class and the "subtract base_off" navigation.
 
 ## Compression
 
