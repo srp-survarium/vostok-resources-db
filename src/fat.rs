@@ -13,6 +13,11 @@ use std::path::Path;
 
 use bytemuck::{Pod, Zeroable};
 
+// The FAT stores 64-bit offsets; we read them as u64 and use them as usize for
+// indexing the buffer and seeking the file. That truncates on a 32-bit target,
+// so require usize == u64 (a 64-bit host).
+const _: () = assert!(std::mem::size_of::<usize>() == std::mem::size_of::<u64>());
+
 /// On-disk FAT header — `sources/vostok/vfs/sources/fat_header.h`.
 ///
 /// `fat_header` has no `#pragma pack`, so the two `u32`s are 4-byte aligned and
@@ -262,7 +267,12 @@ impl Archive {
         self.read::<u64>(folder_start) as usize
     }
 
-    fn walk_folder_children(&self, folder_base_node_off: usize, prefix: &str, out: &mut Vec<FileEntry>) {
+    fn walk_folder_children(
+        &self,
+        folder_base_node_off: usize,
+        prefix: &str,
+        out: &mut Vec<FileEntry>,
+    ) {
         let flags = self.flags_at(folder_base_node_off);
         let mut child = self.first_child_of_folder(folder_base_node_off, flags);
         while child != 0 {
@@ -303,7 +313,14 @@ impl Archive {
                     entry.kind = self.kind_for(ref_flags);
                     out.push(entry);
                 } else {
-                    out.push(FileEntry { path, kind, size_in_db: 0, uncompressed_size: 0, pos_in_db: 0, inline_buffer_offset: None });
+                    out.push(FileEntry {
+                        path,
+                        kind,
+                        size_in_db: 0,
+                        uncompressed_size: 0,
+                        pos_in_db: 0,
+                        inline_buffer_offset: None,
+                    });
                 }
             }
             // Soft-links / erased / external nodes do not carry directly
@@ -343,7 +360,10 @@ impl Archive {
         };
         FileEntry {
             path,
-            kind: NodeKind::File { compressed, inlined },
+            kind: NodeKind::File {
+                compressed,
+                inlined,
+            },
             size_in_db: afnb.size_in_db,
             uncompressed_size,
             pos_in_db: afnb.pos_in_db,
@@ -372,7 +392,9 @@ impl Archive {
     pub fn read_file(&mut self, e: &FileEntry) -> io::Result<Vec<u8>> {
         let raw = self.read_raw(e)?;
         match e.kind {
-            NodeKind::File { compressed: true, .. } => Err(io::Error::new(
+            NodeKind::File {
+                compressed: true, ..
+            } => Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "PPMd-compressed payload — decoder is on the `ppmd` branch",
             )),

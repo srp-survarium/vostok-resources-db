@@ -47,12 +47,18 @@ fn main() -> ExitCode {
 
 fn run_list(db: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let archive = Archive::open(db)?;
-    eprintln!("num_nodes={} buffer_size={}", archive.num_nodes, archive.buffer_size);
+    eprintln!(
+        "num_nodes={} buffer_size={}",
+        archive.num_nodes, archive.buffer_size
+    );
     let entries = archive.list();
     let (mut files, mut compressed, mut inline) = (0usize, 0usize, 0usize);
     for e in &entries {
         let tag = match e.kind {
-            NodeKind::File { compressed: c, inlined: i } => {
+            NodeKind::File {
+                compressed: c,
+                inlined: i,
+            } => {
                 files += 1;
                 if c {
                     compressed += 1;
@@ -91,7 +97,10 @@ fn run_list(db: &Path) -> Result<(), Box<dyn std::error::Error>> {
 
 fn run_extract(db: &Path, out_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let mut archive = Archive::open(db)?;
-    eprintln!("num_nodes={} buffer_size={}", archive.num_nodes, archive.buffer_size);
+    eprintln!(
+        "num_nodes={} buffer_size={}",
+        archive.num_nodes, archive.buffer_size
+    );
     let entries = archive.list();
 
     let (mut extracted, mut skipped) = (0usize, 0usize);
@@ -105,8 +114,8 @@ fn run_extract(db: &Path, out_dir: &Path) -> Result<(), Box<dyn std::error::Erro
             fs::create_dir_all(parent)?;
         }
         let data = archive.read_file(e)?;
-        let mut f = fs::File::create(&dest)
-            .map_err(|err| format!("creating {}: {err}", dest.display()))?;
+        let mut f =
+            fs::File::create(&dest).map_err(|err| format!("creating {}: {err}", dest.display()))?;
         f.write_all(&data)?;
         extracted += 1;
         if extracted % 1000 == 0 {

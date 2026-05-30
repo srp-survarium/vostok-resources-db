@@ -19,4 +19,4 @@
 
 pub mod fat;
 
-pub use fat::{Archive, NodeKind, FileEntry};
+pub use fat::{Archive, FileEntry, NodeKind};
